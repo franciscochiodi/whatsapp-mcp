@@ -1,3 +1,4 @@
+import os
 import signal
 import sys
 from typing import Any
@@ -362,8 +363,20 @@ def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
 
 
 def shutdown_handler(signum, frame):
-    """Handle shutdown signals gracefully to prevent zombie processes."""
-    sys.exit(0)
+    """Handle shutdown signals gracefully to prevent zombie processes.
+
+    Use os._exit() instead of sys.exit() to terminate immediately without
+    running interpreter finalization. Under stdio transport, asyncio/transport
+    daemon threads may hold the stdout/stderr buffer lock; finalization tries
+    to close those buffers and aborts with "_enter_buffered_busy: could not
+    acquire lock ... at interpreter shutdown".
+    """
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(0)
 
 
 if __name__ == "__main__":
@@ -371,5 +384,24 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Initialize and run the server
-    mcp.run(transport="stdio")
+    # Run the server. The host (Claude) usually shuts a stdio server down by
+    # closing the pipe (EOF on stdin), so mcp.run() returns/raises SystemExit
+    # rather than us getting a signal. Either way, skip interpreter finalization
+    # via os._exit(): a daemon asyncio thread may still hold the stdout buffer
+    # lock, and finalization's buffer close would abort with _enter_buffered_busy.
+    exit_code = 0
+    try:
+        mcp.run(transport="stdio")
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 0
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        exit_code = 1
+    finally:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(exit_code)
